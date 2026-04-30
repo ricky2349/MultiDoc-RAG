@@ -30,6 +30,19 @@ DAILY_CHAT_HINTS = (
     "周末",
     "心情",
 )
+SMALL_TALK_HINTS = (
+    "谢谢",
+    "感谢",
+    "再见",
+    "拜拜",
+    "哈哈",
+    "聊聊",
+    "在干嘛",
+    "你好吗",
+    "你最近",
+    "真不错",
+    "挺好",
+)
 DOC_RELATED_HINTS = (
     "文档",
     "pdf",
@@ -42,6 +55,7 @@ DOC_RELATED_HINTS = (
     "微调",
     "来源",
 )
+USE_LLM_INTENT_CHECK = True
 
 
 @st.cache_resource
@@ -185,9 +199,24 @@ def is_simple_chitchat(text: str) -> bool:
         return False
     if any(k in normalized for k in DAILY_CHAT_HINTS):
         return True
-    if len(normalized) <= 16 and ("?" not in normalized and "？" not in normalized):
+    if any(k in normalized for k in SMALL_TALK_HINTS):
         return True
-    return normalized in {"你是谁", "你是", "在吗", "在不在"}
+    if len(normalized) <= 20 and ("?" not in normalized and "？" not in normalized):
+        return True
+    if normalized in {"你是谁", "你是", "在吗", "在不在", "忙吗"}:
+        return True
+    return False
+
+
+def llm_intent_is_chitchat(text: str) -> bool:
+    prompt = (
+        "请判断下面用户输入是否属于“闲聊/问候/日常寒暄”。\n"
+        "若属于，输出 CHITCHAT；若属于“需要查阅已上传文档/网页内容的问题”，输出 DOC_QUERY。\n"
+        "只能输出 CHITCHAT 或 DOC_QUERY，不要输出其他内容。\n\n"
+        f"用户输入：{text}"
+    )
+    label = get_llm().invoke(prompt).content.strip().upper()
+    return label.startswith("CHITCHAT")
 
 
 def answer_chitchat(user_input: str) -> str:
@@ -299,7 +328,12 @@ def main():
             with st.spinner("正在检索并生成回答..."):
                 try:
                     st.session_state.last_sources = []
-                    if is_simple_chitchat(user_input):
+                    chitchat = is_simple_chitchat(user_input)
+                    if not chitchat and USE_LLM_INTENT_CHECK:
+                        # 仅在规则未命中时调用一次轻量意图判断，减少误判
+                        chitchat = llm_intent_is_chitchat(user_input)
+
+                    if chitchat:
                         answer = answer_chitchat(user_input)
                         sources = []
                     else:
@@ -310,8 +344,8 @@ def main():
                     if "Agent stopped due to iteration limit or time limit" in answer:
                         answer, sources = fallback_rag_answer(user_input)
                     st.markdown(answer)
-                    if sources:
-                        st.caption("引用来源: " + " | ".join(sources))
+                    #if sources:
+                    #     st.caption("引用来源: " + " | ".join(sources))
                     st.session_state.messages.append(
                         {"role": "assistant", "content": answer, "sources": sources}
                     )
