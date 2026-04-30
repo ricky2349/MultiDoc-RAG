@@ -43,7 +43,7 @@
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/yourname/MultiDoc-RAG-Agent.git
+git clone https://github.com/ricky2349/MultiDoc-RAG-Agent.git
 cd MultiDoc-RAG-Agent
 ```
 ### 2. 创建虚拟环境
