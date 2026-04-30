@@ -1,0 +1,23 @@
+# 虚拟环境
+venv/
+.venv/
+
+# 环境变量（包含 API 密钥）
+.env
+
+# 向量数据库存储（如果 Chroma 生成了本地文件夹）
+chroma_db/
+*.sqlite3
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# 日志和临时文件
+*.log
+*.tmp
