@@ -1,193 +1,128 @@
 import os
-import sys
 from pathlib import Path
-
 from dotenv import load_dotenv
-from langchain.agents import create_agent
-from langchain_classic.memory import ConversationBufferMemory
 from langchain_openai import ChatOpenAI
 from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain_core.messages import AIMessage, HumanMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
 
+# 全局变量（惰性初始化）
+_vectorstore = None
+_retriever = None
+_llm = None
+_embeddings = None
+_chat_history = []
 
-# 1. 加载文档（docs 文件夹下所有 PDF + 可选网页 URL）
-def load_documents(docs_dir: str = "./docs/", web_url: str | None = None):
+def get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        print("加载本地嵌入模型...")
+        _embeddings = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-small-zh-v1.5",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+    return _embeddings
+
+def get_llm():
+    global _llm
+    if _llm is None:
+        deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not deepseek_api_key:
+            raise ValueError("请在 .env 文件中设置 DEEPSEEK_API_KEY")
+        _llm = ChatOpenAI(
+            model="deepseek-chat",
+            openai_api_key=deepseek_api_key,
+            openai_api_base="https://api.deepseek.com/v1",
+            temperature=0,
+        )
+    return _llm
+
+def build_vectorstore_from_docs(docs):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
+    vectorstore = Chroma.from_documents(chunks, get_embeddings())
+    return vectorstore
+
+def load_documents_from_sources(file_paths=None, web_url=None):
     all_docs = []
-    pdf_dir = Path(docs_dir)
-
-    if pdf_dir.exists():
-        pdf_files = sorted(pdf_dir.glob("*.pdf"))
-        for pdf_file in pdf_files:
-            loader = PyPDFLoader(str(pdf_file))
-            pdf_docs = loader.load()
-            for doc in pdf_docs:
-                doc.metadata["source"] = pdf_file.name
-            all_docs.extend(pdf_docs)
-    else:
-        print(f"[WARN] PDF 目录不存在: {docs_dir}")
-
+    if file_paths:
+        for path in file_paths:
+            loader = PyPDFLoader(str(path))
+            for doc in loader.load():
+                doc.metadata["source"] = Path(path).name
+                all_docs.append(doc)
     if web_url:
-        web_loader = WebBaseLoader(web_url)
-        web_docs = web_loader.load()
-        for doc in web_docs:
+        loader = WebBaseLoader(web_url)
+        for doc in loader.load():
             doc.metadata["source"] = web_url
-        all_docs.extend(web_docs)
-
+            all_docs.append(doc)
     if not all_docs:
-        raise ValueError("未加载到任何文档。请检查 ./docs/ 下是否有 PDF，或提供有效 URL。")
-
-    print(f"[INFO] 共加载文档页/片段数: {len(all_docs)}")
+        raise ValueError("未提供任何有效文档。")
     return all_docs
 
-
-def get_web_url_input() -> str | None:
-    env_url = os.getenv("RAG_WEB_URL", "").strip()
-    if env_url:
-        return env_url
-
-    if sys.stdin and sys.stdin.isatty():
-        user_url = input("可选：请输入要加载的网页 URL（直接回车跳过）：").strip()
-        return user_url or None
-
-    return None
-
-
-docs = load_documents("./docs/", get_web_url_input())
-
-# 2. 分割文本
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-chunks = text_splitter.split_documents(docs)
-
-# 3. 使用本地 HuggingFace embeddings
-print("加载本地嵌入模型...")
-embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
-
-# 4. 创建向量数据库
-vectorstore = Chroma.from_documents(chunks, embeddings)
-retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-
-# 5. 配置 DeepSeek LLM
-deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
-if not deepseek_api_key:
-    raise ValueError("请在 .env 文件中设置 DEEPSEEK_API_KEY")
-
-llm = ChatOpenAI(
-    model="deepseek-chat",
-    openai_api_key=deepseek_api_key,
-    openai_api_base="https://api.deepseek.com/v1",
-    temperature=0,
+def init_vectorstore(file_paths=None, web_url=None):
+    global _vectorstore, _retriever
+    docs = load_documents_from_sources(file_paths, web_url)
+    _vectorstore = build_vectorstore_from_docs(docs)
+    _retriever = _vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 6, "fetch_k": 12}
 )
-
-
 def format_docs(docs):
     if not docs:
         return "无相关文档"
-
-    unique_docs = []
     seen = set()
-
+    formatted = []
     for doc in docs:
-        content = " ".join(doc.page_content.split())
-        source = doc.metadata.get("source", "")
-        page = doc.metadata.get("page", "")
-        key = (source, page, content)
+        content = doc.page_content.strip()
+        source = doc.metadata.get("source", "未知来源")
+        key = (source, content[:200])
         if key in seen:
             continue
         seen.add(key)
-        unique_docs.append(doc)
+        if len(content) > 800:
+            content = content[:800] + "..."
+        formatted.append(f"[来源: {source}]\n{content}")
+    return "\n\n".join(formatted)
 
-    formatted_chunks = []
-    for doc in unique_docs:
-        source = doc.metadata.get("source", "未知来源")
-        header = f"[来源: {source}]"
-        formatted_chunks.append(f"{header}\n{doc.page_content.strip()}")
-
-    return "\n\n".join(formatted_chunks)
-
-
-def DocumentRetriever(question: str) -> str:
-    """检索与用户问题相关的文档片段，返回带来源标记的内容。"""
-    docs = retriever.invoke(question)
-    return format_docs(docs)
-
-# 6. Prompt 配置
-PROMPT_V1 = """
-你是一个智能问答 Agent。
-你可以与用户闲聊，也可以在需要时调用工具检索文档。
-只有当用户的问题需要基于文档内容、网页内容或前文提到的文档主题来回答时，才调用 DocumentRetriever。
-如果只是普通闲聊、问候、简单常识或不需要文档依据的问题，不要调用任何工具，直接回答。
-回答时保持简洁、自然、清晰。
-""".strip()
-
-PROMPT_V2 = """
-你是一个智能问答 Agent。
-你可以与用户闲聊，也可以在需要时调用工具检索文档。
-只有当用户的问题需要基于文档内容、网页内容或前文提到的文档主题来回答时，才调用 DocumentRetriever。
-如果只是普通闲聊、问候、简单常识或不需要文档依据的问题，不要调用任何工具，直接回答。
-如果使用了工具，请严格基于检索到的内容回答，不要编造，不要把历史回答当作新的文档证据。
-如果答案无法从当前检索结果中明确得到，请直接回答“根据现有文档无法回答该问题。”
-如果使用了文档内容，请尽量在相关结论后标注来源，例如“（来源：PEFT_Methods.pdf）”。
-回答时避免重复表述，保持简洁清晰。
-""".strip()
-
-PROMPT_V3 = """
-你是一个智能问答 Agent。
-你可以与用户闲聊，也可以在需要时调用工具检索文档。
-只有当用户的问题需要基于文档内容、网页内容或前文提到的文档主题来回答时，才调用 DocumentRetriever。
-如果只是普通闲聊、问候、简单常识或不需要文档依据的问题，不要调用任何工具，直接回答。
-
-在需要文档回答时，请先在内部梳理问题要点，再基于检索结果作答，但不要输出你的思维过程。
-如果问题涉及对比、优缺点、差异、取舍、推荐等内容，请优先使用“对比总结”的方式回答，明确列出各选项差异。
-如果使用了工具，请严格基于检索到的内容回答，不要编造，不要把历史回答当作新的文档证据。
-如果答案无法从当前检索结果中明确得到，请直接回答“根据现有文档无法回答该问题。”
-如果使用了文档内容，请在关键结论后尽量标注来源，例如“（来源：PEFT_Methods.pdf）”。
-回答时避免重复表述，保持层次清晰，优先给出结论，再补充依据。
-""".strip()
-
-# 手动切换当前使用的 prompt：
-# ACTIVE_PROMPT = PROMPT_V1
-# ACTIVE_PROMPT = PROMPT_V2
-ACTIVE_PROMPT = PROMPT_V3
-
-# 6. 对话记忆
-memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    input_key="input",
-    output_key="output",
-    return_messages=True,
-)
-
-# 7. Agent
-agent = create_agent(
-    model=llm,
-    tools=[DocumentRetriever],
-    system_prompt=ACTIVE_PROMPT,
-)
-
-# 8. 对外查询函数
 def query_rag(question: str) -> str:
-    history = memory.load_memory_variables({"input": question}).get("chat_history", [])
-    messages = [*history, HumanMessage(content=question)]
-    result = agent.invoke({"messages": messages})
+    global _chat_history
+    if _retriever is None:
+        raise RuntimeError("向量库未初始化，请先调用 init_vectorstore。")
 
-    output_messages = result.get("messages", [])
-    answer = ""
-    for message in reversed(output_messages):
-        if isinstance(message, AIMessage) and message.content:
-            answer = message.content
-            break
+    history_text = ""
+    for msg in _chat_history:
+        role = "用户" if msg["role"] == "user" else "助手"
+        history_text += f"{role}: {msg['content']}\n"
 
-    if not answer:
-        raise ValueError("Agent 未返回有效回答。")
+    docs = _retriever.invoke(question)
+    context = format_docs(docs)
 
-    memory.save_context({"input": question}, {"output": answer})
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "你是一个中文问答助手。请基于历史对话和当前检索上下文回答用户问题。如果问题包含代词，需从历史对话中确定指代对象。若上下文不足，回答“根据现有文档无法回答该问题”。回答中如需引用文档，请在每个关键结论后使用括号标注来源，格式为（来源：文件名），且全文只标注一次，不要重复。"),
+        ("human", "历史对话：\n{history}\n\n当前检索上下文：\n{context}\n\n用户问题：\n{question}\n\n请直接回答：")
+    ])
+
+    chain = prompt | get_llm() | StrOutputParser()
+    answer = chain.invoke({
+        "history": history_text,
+        "context": context,
+        "question": question
+    })
+
+    _chat_history.append({"role": "user", "content": question})
+    _chat_history.append({"role": "assistant", "content": answer})
+    if len(_chat_history) > 10:
+        _chat_history = _chat_history[-10:]
+
     return answer
 
-
-if __name__ == "__main__":
-    print(query_rag("你好"))
+def clear_history():
+    global _chat_history
+    _chat_history = []
